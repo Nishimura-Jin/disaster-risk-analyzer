@@ -8,13 +8,16 @@
 - SQLiteへの保存
 - 分析・可視化（Streamlit）
 
-## 技術
+## 使用技術
+
 - Python
 - Streamlit
-- pandas
+- Pandas
 - SQLite
+- Requests
+- USGS Earthquake API
 
 ## 起動方法
 ```bash
-cd backend
-streamlit run streamlit_app.py
+pip install streamlit pandas requests
+streamlit run app.py
