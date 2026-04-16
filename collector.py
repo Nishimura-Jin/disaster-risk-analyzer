@@ -20,9 +20,12 @@ def save(data):
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS disasters (
-        snapshot_hour TEXT,
-        region TEXT,
-        event_type TEXT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_hour TEXT NOT NULL,
+        hour INTEGER NOT NULL,
+        region TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        intensity INTEGER NOT NULL,
         UNIQUE(snapshot_hour, region, event_type)
     )
     """)
@@ -38,8 +41,15 @@ def save(data):
 
                     conn.execute("""
                     INSERT OR IGNORE INTO disasters
-                    VALUES (?, ?, ?)
-                    """, (now.isoformat(), region, warning.get("code")))
+                    (snapshot_hour, hour, region, event_type, intensity)
+                    VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        now.isoformat(),
+                        now.hour,
+                        region,
+                        warning.get("code"),
+                        1
+                    ))
 
     conn.commit()
     conn.close()
