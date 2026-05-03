@@ -11,19 +11,20 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 APP_TZ = ZoneInfo("Asia/Tokyo")
-
-
-def now():
-    return datetime.now(APP_TZ)
-
-
-TODAY = now().date()
+TODAY = datetime.now(APP_TZ).date()
 TARGET_DATE = (TODAY - timedelta(days=1)).isoformat()
 
 DB_PATH = Path(__file__).resolve().parent / "disaster.db"
 
 JMA_URL = "https://www.jma.go.jp/bosai/warning/data/warning/map.json"
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+TEMP_DANGER = 35
+TEMP_WARNING = 30
+RAIN_DANGER = 50
+RAIN_WARNING = 20
+RISK_DANGER = 7
+RISK_WARNING = 3
 
 EVENT_MAP = {
     "14": "大雨",
@@ -141,11 +142,9 @@ PREF_COORDS = {
 }
 
 
-# ================= DB =================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript(
-            """
+        conn.executescript("""
         CREATE TABLE IF NOT EXISTS disaster (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             observed_date TEXT,
@@ -163,14 +162,12 @@ def init_db():
             precipitation_sum REAL,
             fetched_at TEXT
         );
-        """
-        )
+        """)
 
 
 init_db()
 
 
-# ================= データ取得 =================
 def fetch_disaster():
     try:
         res = requests.get(JMA_URL, timeout=20)
@@ -179,7 +176,7 @@ def fetch_disaster():
         st.error(f"災害データ取得失敗: {e}")
         return []
 
-    snapshot = now().isoformat()
+    snapshot = datetime.now(APP_TZ).isoformat()
     records = []
 
     for report in res.json():
@@ -205,6 +202,7 @@ def fetch_weather():
     start = (TODAY - timedelta(days=8)).isoformat()
     end = TARGET_DATE
     records = []
+    failed = []
 
     for region, (lat, lon) in PREF_COORDS.items():
         try:
@@ -224,14 +222,26 @@ def fetch_weather():
             daily = res.json().get("daily", {})
             if not daily.get("time"):
                 continue
-        except Exception as e:
-            st.warning(f"{region} の気象データ取得失敗: {e}")
+        except Exception:
+            failed.append(region)
             continue
 
         for d, t, p in zip(
             daily["time"], daily["temperature_2m_max"], daily["precipitation_sum"]
         ):
-            records.append((d, region, float(t or 0), float(p or 0), now().isoformat()))
+            records.append(
+                (
+                    d,
+                    region,
+                    float(t or 0),
+                    float(p or 0),
+                    datetime.now(APP_TZ).isoformat(),
+                )
+            )
+
+    if failed:
+        st.warning(f"気象データ取得失敗: {', '.join(failed)}")
+
     return records
 
 
@@ -249,9 +259,12 @@ def save_data(disaster, weather):
         conn.commit()
 
 
-# ================= 分析 =================
 def classify(score):
-    return "危険" if score >= 7 else "注意" if score >= 3 else "安全"
+    if score >= RISK_DANGER:
+        return "危険"
+    if score >= RISK_WARNING:
+        return "注意"
+    return "安全"
 
 
 def calc_scores(df):
@@ -267,11 +280,12 @@ def calc_scores(df):
         df.get("warning_count", 0), errors="coerce"
     ).fillna(0)
 
-    df["temp_score"] = (df["temperature_max"] >= 35) * 3 + (
-        (df["temperature_max"] >= 30) & (df["temperature_max"] < 35)
+    df["temp_score"] = (df["temperature_max"] >= TEMP_DANGER) * 3 + (
+        (df["temperature_max"] >= TEMP_WARNING) & (df["temperature_max"] < TEMP_DANGER)
     ) * 2
-    df["rain_score"] = (df["precipitation_sum"] >= 50) * 3 + (
-        (df["precipitation_sum"] >= 20) & (df["precipitation_sum"] < 50)
+    df["rain_score"] = (df["precipitation_sum"] >= RAIN_DANGER) * 3 + (
+        (df["precipitation_sum"] >= RAIN_WARNING)
+        & (df["precipitation_sum"] < RAIN_DANGER)
     ) * 2
     df["warn_score"] = (df["warning_count"] > 0) * 3
 
@@ -296,20 +310,18 @@ def build_risk_df(w_df, d_df):
     return calc_scores(df).drop_duplicates(["observed_date", "region"])
 
 
-# ================= リスクに応じたコメント生成 =================
 def generate_risk_comment(row):
-    """リスクスコアの内訳をもとに状況を説明するコメントを生成する"""
     parts = []
 
     if row["temp_score"] >= 3:
-        parts.append("猛暑（35℃以上）")
+        parts.append(f"猛暑（{TEMP_DANGER}℃以上）")
     elif row["temp_score"] >= 2:
-        parts.append("高温（30℃以上）")
+        parts.append(f"高温（{TEMP_WARNING}℃以上）")
 
     if row["rain_score"] >= 3:
-        parts.append("大雨（50mm以上）")
+        parts.append(f"大雨（{RAIN_DANGER}mm以上）")
     elif row["rain_score"] >= 2:
-        parts.append("強雨（20mm以上）")
+        parts.append(f"強雨（{RAIN_WARNING}mm以上）")
 
     if row["warn_score"] > 0:
         parts.append("気象警報発令中")
@@ -320,7 +332,6 @@ def generate_risk_comment(row):
     return "・".join(parts) + " によりリスクが上昇しています"
 
 
-# ================= UI =================
 st.title("災害リスク分析ツール")
 
 if st.button("最新データを取得"):
@@ -328,7 +339,7 @@ if st.button("最新データを取得"):
     save_data(d, w)
     st.success(f"取得完了：災害 {len(d)}件 / 気象 {len(w)}件")
 
-st.caption(f"最終更新: {now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"最終更新: {datetime.now(APP_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
 
 with sqlite3.connect(DB_PATH) as conn:
     weather_df = pd.read_sql("SELECT * FROM weather", conn)
@@ -353,7 +364,6 @@ latest["risk_level"] = latest["risk_level"].fillna("安全")
 
 rank = latest.sort_values("risk_score", ascending=False)
 
-# ================= サマリー =================
 st.header("サマリー")
 
 if rank.empty:
@@ -362,8 +372,7 @@ if rank.empty:
 
 top = rank.iloc[0]
 
-st.info(
-    f"""
+st.info(f"""
 最大リスク地域：{top['region']}（{top['risk_level']}）
 
 ▶ 現在の状況：
@@ -374,10 +383,8 @@ st.info(
 ・降水スコア：{int(top['rain_score'])}
 ・警報スコア：{int(top['warn_score'])}
 ・総合リスク：{int(top['risk_score'])}
-"""
-)
+""")
 
-# ================= 警報 =================
 st.header("現在の警報")
 
 warned = False
@@ -393,7 +400,6 @@ for region in PREF_COORDS.keys():
 if not warned:
     st.success("現在、発令中の警報はありません")
 
-# ================= ランキング =================
 st.header("リスクランキング")
 
 st.dataframe(
@@ -410,7 +416,6 @@ st.dataframe(
     hide_index=True,
 )
 
-# ================= グラフ =================
 st.header("地域トレンド")
 
 regions = sorted(PREF_COORDS.keys())
@@ -440,20 +445,19 @@ st.altair_chart(
     use_container_width=True,
 )
 
-# ================= 地図 =================
 st.markdown("### 地域ごとのリスク分布（赤いほど危険）")
 st.caption("※ 注意以上の地域のみ表示（円の大きさは警報数を表します）")
 
 m = folium.Map(location=[36, 138], zoom_start=5)
 
 for _, r in latest.iterrows():
-    if r["risk_score"] < 3:
+    if r["risk_score"] < RISK_WARNING:
         continue
 
     if r["region"] not in PREF_COORDS:
         continue
 
-    color = "red" if r["risk_score"] >= 7 else "orange"
+    color = "red" if r["risk_score"] >= RISK_DANGER else "orange"
 
     popup_html = f"""
     <b>{r['region']}</b><br>
@@ -472,11 +476,9 @@ for _, r in latest.iterrows():
 
 st_folium(m, width=900, height=500)
 
-# ================= 説明 =================
 st.header("仕組み")
 
-st.markdown(
-    """
+st.markdown("""
 - **JMA**：気象庁から現在の警報情報を取得
 - **Open-Meteo**：過去8日分の気象データ（最高気温・降水量）を取得
 - **スコア計算**：気温・降水・警報の3指標を数値化して統合評価
@@ -484,5 +486,4 @@ st.markdown(
     - 降水50mm以上：+3 / 20mm以上：+2
     - 警報発令中：+3
     - 合計7以上：危険 / 3以上：注意 / 3未満：安全
-"""
-)
+""")
