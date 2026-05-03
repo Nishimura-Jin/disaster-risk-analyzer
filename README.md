@@ -4,6 +4,13 @@
 
 ---
 
+## デモ
+
+https://disaster-risk-analyzer.streamlit.app/
+
+※ 一定時間アクセスがないとスリープします。
+スリープ中は画面に「This app has gone to sleep」と表示されます。
+画面内の「Yes, get this app back up!」ボタンを押すと1分ほどで復帰します。
 ## 制作背景
 
 近年、日本各地で豪雨や猛暑などの気象災害が増加しています。「どの地域が今どれくらい危険なのか」を一目で把握できるツールがあれば、早めの行動につながると考え制作しました。
@@ -49,6 +56,7 @@
 | Folium | 地図描画 |
 | requests | 外部APIへのHTTPリクエスト |
 
+| インフラ | Streamlit Cloud |
 ---
 
 ## 使用API
