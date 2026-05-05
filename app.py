@@ -23,8 +23,20 @@ TEMP_DANGER = 35
 TEMP_WARNING = 30
 RAIN_DANGER = 50
 RAIN_WARNING = 20
-RISK_DANGER = 7
-RISK_WARNING = 3
+RISK_DANGER = 15
+RISK_WARNING = 5
+RISK_CAUTION = 10
+SCORE_MAX = 20
+WARN_MIN_SCORE = 5  # 警報あり時の最低スコア
+FREEZE_TEMP = 0  # 凍結リスクの気温閾値
+TEMP_EXTREME = 38  # 極端な高温閾値
+
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+COLOR_DANGER = "#e03131"
+COLOR_CAUTION = "#e8590c"
+COLOR_WARNING = "#f76707"
+COLOR_SAFE = "#2f9e44"
 
 EVENT_MAP = {
     "14": "大雨",
@@ -90,6 +102,58 @@ REGION_MAP = {
     "46": "鹿児島県",
     "47": "沖縄県",
 }
+
+BLOCK_MAP = {
+    "北海道": "北海道",
+    "青森県": "東北",
+    "岩手県": "東北",
+    "宮城県": "東北",
+    "秋田県": "東北",
+    "山形県": "東北",
+    "福島県": "東北",
+    "茨城県": "関東",
+    "栃木県": "関東",
+    "群馬県": "関東",
+    "埼玉県": "関東",
+    "千葉県": "関東",
+    "東京都": "関東",
+    "神奈川県": "関東",
+    "新潟県": "中部",
+    "富山県": "中部",
+    "石川県": "中部",
+    "福井県": "中部",
+    "山梨県": "中部",
+    "長野県": "中部",
+    "岐阜県": "中部",
+    "静岡県": "中部",
+    "愛知県": "中部",
+    "三重県": "近畿",
+    "滋賀県": "近畿",
+    "京都府": "近畿",
+    "大阪府": "近畿",
+    "兵庫県": "近畿",
+    "奈良県": "近畿",
+    "和歌山県": "近畿",
+    "鳥取県": "中国",
+    "島根県": "中国",
+    "岡山県": "中国",
+    "広島県": "中国",
+    "山口県": "中国",
+    "徳島県": "四国",
+    "香川県": "四国",
+    "愛媛県": "四国",
+    "高知県": "四国",
+    "福岡県": "九州",
+    "佐賀県": "九州",
+    "長崎県": "九州",
+    "熊本県": "九州",
+    "大分県": "九州",
+    "宮崎県": "九州",
+    "鹿児島県": "九州",
+    "沖縄県": "沖縄",
+}
+
+BLOCK_ORDER = ["北海道", "東北", "関東", "中部", "近畿", "中国", "四国", "九州", "沖縄"]
 
 PREF_COORDS = {
     "北海道": (43.0642, 141.3469),
@@ -262,6 +326,8 @@ def save_data(disaster, weather):
 def classify(score):
     if score >= RISK_DANGER:
         return "危険"
+    if score >= RISK_CAUTION:
+        return "警戒"
     if score >= RISK_WARNING:
         return "注意"
     return "安全"
@@ -280,29 +346,64 @@ def calc_scores(df):
         df.get("warning_count", 0), errors="coerce"
     ).fillna(0)
 
-    df["temp_score"] = (df["temperature_max"] >= TEMP_DANGER) * 3 + (
-        (df["temperature_max"] >= TEMP_WARNING) & (df["temperature_max"] < TEMP_DANGER)
-    ) * 2
-    df["rain_score"] = (df["precipitation_sum"] >= RAIN_DANGER) * 3 + (
+    # 気温スコア（夏：熱中症リスク・冬：凍結リスク）
+    df["temp_score"] = (
+        (df["temperature_max"] >= TEMP_EXTREME) * 5
+        + (
+            (df["temperature_max"] >= TEMP_DANGER)
+            & (df["temperature_max"] < TEMP_EXTREME)
+        )
+        * 3
+        + (
+            (df["temperature_max"] >= TEMP_WARNING)
+            & (df["temperature_max"] < TEMP_DANGER)
+        )
+        * 2
+        + ((df["temperature_max"] <= FREEZE_TEMP) & (df["precipitation_sum"] > 0)) * 3
+    )
+
+    # 降水スコア
+    df["rain_score"] = (df["precipitation_sum"] >= RAIN_DANGER) * 6 + (
         (df["precipitation_sum"] >= RAIN_WARNING)
         & (df["precipitation_sum"] < RAIN_DANGER)
-    ) * 2
-    df["warn_score"] = (df["warning_count"] > 0) * 3
+    ) * 3
 
-    df["risk_score"] = df["temp_score"] + df["rain_score"] + df["warn_score"]
+    # 複合スコア：高温かつ大雨（熱中症・土砂災害の重複リスク）
+    df["compound_score"] = (
+        (df["temperature_max"] >= TEMP_WARNING)
+        & (df["precipitation_sum"] >= RAIN_WARNING)
+    ).astype(int) * 3
+
+    # 警報スコア（警報あり時の底上げ）
+    df["warn_score"] = (df["warning_count"] > 0).astype(int) * 3
+
+    # 合計スコア（上限クリップ）
+    raw_score = (
+        df["temp_score"] + df["rain_score"] + df["compound_score"] + df["warn_score"]
+    )
+    df["risk_score"] = raw_score.clip(upper=SCORE_MAX)
+
+    # 警報あり時は最低スコアを保証
+    df.loc[df["warning_count"] > 0, "risk_score"] = df.loc[
+        df["warning_count"] > 0, "risk_score"
+    ].clip(lower=WARN_MIN_SCORE)
+
     df["risk_level"] = df["risk_score"].apply(classify)
 
     return df
 
 
 def build_risk_df(w_df, d_df):
-    warning = (
-        d_df.groupby(["observed_date", "region"])
-        .size()
-        .reset_index(name="warning_count")
-        if not d_df.empty
-        else pd.DataFrame(columns=["observed_date", "region", "warning_count"])
-    )
+    # 警報件数を集計（スコアの底上げ補正に使用）
+    if not d_df.empty:
+        warning = (
+            d_df.drop_duplicates(subset=["observed_date", "region", "event_type"])
+            .groupby(["observed_date", "region"])
+            .size()
+            .reset_index(name="warning_count")
+        )
+    else:
+        warning = pd.DataFrame(columns=["observed_date", "region", "warning_count"])
 
     df = w_df.merge(warning, on=["observed_date", "region"], how="left")
     df["warning_count"] = df["warning_count"].fillna(0)
@@ -310,20 +411,64 @@ def build_risk_df(w_df, d_df):
     return calc_scores(df).drop_duplicates(["observed_date", "region"])
 
 
+@st.cache_data(ttl=3600)
+def fetch_forecast(region, lat, lon):
+    """Open-Meteo予報APIで今後7日間のデータを取得"""
+    try:
+        res = requests.get(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max,precipitation_sum",
+                "timezone": "Asia/Tokyo",
+                "forecast_days": 7,
+            },
+            timeout=20,
+        )
+        res.raise_for_status()
+        daily = res.json().get("daily", {})
+        if not daily.get("time"):
+            return []
+    except Exception:
+        return []
+
+    records = []
+    for d, t, p in zip(
+        daily["time"], daily["temperature_2m_max"], daily["precipitation_sum"]
+    ):
+        records.append(
+            {
+                "observed_date": d,
+                "region": region,
+                "temperature_max": float(t or 0),
+                "precipitation_sum": float(p or 0),
+            }
+        )
+    return records
+
+
 def generate_risk_comment(row):
     parts = []
 
-    if row["temp_score"] >= 3:
+    if row.get("temp_score", 0) >= 5:
+        parts.append(f"極端な高温（{TEMP_EXTREME}℃以上）")
+    elif row.get("temp_score", 0) >= 3:
         parts.append(f"猛暑（{TEMP_DANGER}℃以上）")
-    elif row["temp_score"] >= 2:
+    elif row.get("temp_score", 0) >= 2:
         parts.append(f"高温（{TEMP_WARNING}℃以上）")
+    elif row.get("temp_score", 0) >= 3 and row.get("precipitation_sum", 0) > 0:
+        parts.append("凍結・積雪リスク（0℃以下）")
 
-    if row["rain_score"] >= 3:
+    if row.get("rain_score", 0) >= 6:
         parts.append(f"大雨（{RAIN_DANGER}mm以上）")
-    elif row["rain_score"] >= 2:
+    elif row.get("rain_score", 0) >= 3:
         parts.append(f"強雨（{RAIN_WARNING}mm以上）")
 
-    if row["warn_score"] > 0:
+    if row.get("compound_score", 0) > 0:
+        parts.append("高温・大雨の複合リスク")
+
+    if row.get("warn_score", 0) > 0:
         parts.append("気象警報発令中")
 
     if not parts:
@@ -332,158 +477,547 @@ def generate_risk_comment(row):
     return "・".join(parts) + " によりリスクが上昇しています"
 
 
+STATUS_ORDER = {"継続": 0, "発表": 1, "警報から注意報へ移行": 2}
+
+
+def make_threshold_rules(y_warning, y_danger, label_warning, label_danger):
+    """しきい値ラインを2本返すヘルパー"""
+    warning_rule = (
+        alt.Chart(pd.DataFrame({"y": [y_warning], "label": [label_warning]}))
+        .mark_rule(color="gold", strokeDash=[4, 4])
+        .encode(y="y:Q", tooltip=alt.Tooltip("label:N", title="基準"))
+    )
+    danger_rule = (
+        alt.Chart(pd.DataFrame({"y": [y_danger], "label": [label_danger]}))
+        .mark_rule(color=COLOR_DANGER, strokeDash=[4, 4])
+        .encode(y="y:Q", tooltip=alt.Tooltip("label:N", title="基準"))
+    )
+    return warning_rule, danger_rule
+
+
+def make_x_axis(tick_count=None):
+    """日付X軸を返すヘルパー"""
+    axis = alt.Axis(format="%m/%d", labelAngle=0)
+    if tick_count:
+        axis = alt.Axis(format="%m/%d", labelAngle=0, tickCount=tick_count)
+    return alt.X("observed_date:T", title="日付", axis=axis)
+
+
+# ページ設定
+st.set_page_config(page_title="災害リスク分析ツール", layout="wide")
 st.title("災害リスク分析ツール")
 
-if st.button("最新データを取得"):
-    d, w = fetch_disaster(), fetch_weather()
-    save_data(d, w)
-    st.success(f"取得完了：災害 {len(d)}件 / 気象 {len(w)}件")
+# 初回自動取得
+with sqlite3.connect(DB_PATH) as conn:
+    _check = pd.read_sql("SELECT COUNT(*) as cnt FROM weather", conn)
 
-st.caption(f"最終更新: {datetime.now(APP_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+if _check["cnt"].iloc[0] == 0:
+    with st.spinner("初回データを取得しています..."):
+        d, w = fetch_disaster(), fetch_weather()
+        save_data(d, w)
+    st.success(f"初回データ取得完了：災害 {len(d)}件 / 気象 {len(w)}件")
+
+col_btn, col_cap = st.columns([1, 4])
+with col_btn:
+    if st.button("最新データを取得"):
+        d, w = fetch_disaster(), fetch_weather()
+        save_data(d, w)
+        st.success(f"取得完了：災害 {len(d)}件 / 気象 {len(w)}件")
+with col_cap:
+    st.caption(f"最終更新: {datetime.now(APP_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
 
 with sqlite3.connect(DB_PATH) as conn:
     weather_df = pd.read_sql("SELECT * FROM weather", conn)
     disaster_df = pd.read_sql("SELECT * FROM disaster", conn)
 
 if weather_df.empty:
-    st.warning("データがありません")
+    st.warning("データがありません。「最新データを取得」ボタンを押してください。")
     st.stop()
 
 risk_df = build_risk_df(weather_df, disaster_df)
+risk_df["block"] = risk_df["region"].map(BLOCK_MAP)
+
 latest = risk_df[risk_df["observed_date"] == risk_df["observed_date"].max()]
 all_regions = pd.DataFrame({"region": list(PREF_COORDS.keys())})
-
 latest = all_regions.merge(latest, on="region", how="left")
 
 latest["risk_score"] = latest["risk_score"].fillna(0)
 latest["temp_score"] = latest["temp_score"].fillna(0)
 latest["rain_score"] = latest["rain_score"].fillna(0)
-latest["warn_score"] = latest["warn_score"].fillna(0)
 latest["warning_count"] = latest["warning_count"].fillna(0)
+latest["temperature_max"] = latest["temperature_max"].fillna(0)
+latest["precipitation_sum"] = latest["precipitation_sum"].fillna(0)
+latest["warn_score"] = latest["warn_score"].fillna(0)
+latest["compound_score"] = latest["compound_score"].fillna(0)
 latest["risk_level"] = latest["risk_level"].fillna("安全")
+latest["block"] = latest["region"].map(BLOCK_MAP)
 
 rank = latest.sort_values("risk_score", ascending=False)
 
-st.header("サマリー")
+n_danger = int((rank["risk_level"] == "危険").sum())
+n_caution = int((rank["risk_level"] == "警戒").sum())
+n_warning = int((rank["risk_level"] == "注意").sum())
+n_safe = int((rank["risk_level"] == "安全").sum())
 
-if rank.empty:
-    st.warning("データが不足しています")
-    st.stop()
+# タブ構成
+tab1, tab2, tab3, tab4 = st.tabs(["概要", "警報", "地域分析", "気象予測"])
 
-top = rank.iloc[0]
+# ───────────────────────────────
+# タブ1：概要
+# ───────────────────────────────
+with tab1:
+    if rank.empty:
+        st.warning("データが不足しています")
+        st.stop()
 
-st.info(f"""
-最大リスク地域：{top['region']}（{top['risk_level']}）
+    top = rank.iloc[0]
 
-▶ 現在の状況：
-{generate_risk_comment(top)}
+    # 最大リスク地域
+    level_color = (
+        COLOR_DANGER
+        if top["risk_level"] == "危険"
+        else (
+            COLOR_CAUTION
+            if top["risk_level"] == "警戒"
+            else COLOR_WARNING if top["risk_level"] == "注意" else COLOR_SAFE
+        )
+    )
+    st.markdown(
+        f"<h3 style='color:{level_color}'>最大リスク地域：{top['region']}（{top['risk_level']}）</h3>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**{generate_risk_comment(top)}**")
+    st.caption(
+        f"※ 気象データは昨日時点（{TARGET_DATE}）の実績値です　"
+        f"気温スコア：{int(top['temp_score'])} ／ "
+        f"降水スコア：{int(top['rain_score'])} ／ "
+        f"複合スコア：{int(top.get('compound_score', 0))} ／ "
+        f"総合リスク：{int(top['risk_score'])}"
+    )
 
-内訳：
-・気温スコア：{int(top['temp_score'])}
-・降水スコア：{int(top['rain_score'])}
-・警報スコア：{int(top['warn_score'])}
-・総合リスク：{int(top['risk_score'])}
-""")
+    # メトリクス
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("危険", f"{n_danger} 県")
+    m2.metric("警戒", f"{n_caution} 県")
+    m3.metric("注意", f"{n_warning} 県")
+    m4.metric("安全", f"{n_safe} 県")
 
-st.header("現在の警報")
+    st.divider()
 
-warned = False
-for region in PREF_COORDS.keys():
-    d = disaster_df[
-        (disaster_df["region"] == region) & (disaster_df["status"] != "解除")
-    ]
-    if not d.empty:
-        latest_warn = d.sort_values("snapshot_time", ascending=False).iloc[0]
-        st.warning(f"{region}：{latest_warn['event_type']}（{latest_warn['status']}）")
-        warned = True
-
-if not warned:
-    st.success("現在、発令中の警報はありません")
-
-st.header("リスクランキング")
-
-st.dataframe(
-    rank.rename(
-        columns={
-            "region": "地域",
-            "risk_score": "リスク",
-            "risk_level": "危険度",
-            "temp_score": "気温",
-            "rain_score": "降水",
-            "warn_score": "警報",
+    # ドーナツグラフ＋地方ブロック別横棒グラフ
+    donut_df = pd.DataFrame(
+        {
+            "危険度": ["危険", "警戒", "注意", "安全"],
+            "件数": [n_danger, n_caution, n_warning, n_safe],
+            "color": [COLOR_DANGER, COLOR_CAUTION, COLOR_WARNING, COLOR_SAFE],
         }
-    )[["地域", "リスク", "危険度", "気温", "降水", "警報"]],
-    hide_index=True,
-)
+    )
 
-st.header("地域トレンド")
+    donut = (
+        alt.Chart(donut_df)
+        .mark_arc(innerRadius=70, outerRadius=120)
+        .encode(
+            theta=alt.Theta("件数:Q"),
+            color=alt.Color(
+                "危険度:N",
+                scale=alt.Scale(
+                    domain=["危険", "警戒", "注意", "安全"],
+                    range=[COLOR_DANGER, COLOR_CAUTION, COLOR_WARNING, COLOR_SAFE],
+                ),
+                legend=alt.Legend(title="危険度"),
+            ),
+            tooltip=["危険度", "件数"],
+        )
+        .properties(width=280, height=280)
+    )
 
-regions = sorted(PREF_COORDS.keys())
-default_index = regions.index("大阪府") if "大阪府" in regions else 0
-sel = st.selectbox("地域選択", regions, index=default_index)
+    block_risk = (
+        rank.groupby("block")
+        .apply(
+            lambda x: pd.Series(
+                {
+                    "危険": (x["risk_level"] == "危険").sum(),
+                    "警戒": (x["risk_level"] == "警戒").sum(),
+                    "注意": (x["risk_level"] == "注意").sum(),
+                    "安全": (x["risk_level"] == "安全").sum(),
+                }
+            )
+        )
+        .reset_index()
+        .melt(id_vars="block", var_name="危険度", value_name="件数")
+    )
+    block_risk["block"] = pd.Categorical(
+        block_risk["block"], categories=BLOCK_ORDER, ordered=True
+    )
+    block_risk = block_risk.sort_values("block")
 
-chart_df = risk_df[risk_df["region"] == sel].copy()
-chart_df["observed_date"] = pd.to_datetime(chart_df["observed_date"])
+    # 0.5問題対策：危険度が0の行を除外してから表示
+    block_risk_filtered = block_risk[block_risk["件数"] > 0]
 
-st.subheader(f"直近リスク推移 ／ {sel}")
-
-st.altair_chart(
-    alt.Chart(chart_df)
-    .mark_line(color="red")
-    .encode(
-        x=alt.X(
-            "observed_date:T",
-            title="日付",
-            axis=alt.Axis(format="%m/%d", labelAngle=0),
+    bar_base = alt.Chart(block_risk_filtered).encode(
+        x=alt.X("件数:Q", title="都道府県数", axis=alt.Axis(tickMinStep=1)),
+        y=alt.Y("block:N", title="地方", sort=BLOCK_ORDER),
+        color=alt.Color(
+            "危険度:N",
+            scale=alt.Scale(
+                domain=["危険", "注意", "安全"],
+                range=[COLOR_DANGER, COLOR_WARNING, COLOR_SAFE],
+            ),
+            legend=None,
         ),
-        y=alt.Y("risk_score:Q", title="リスクスコア"),
-        tooltip=[
-            alt.Tooltip("observed_date:T", title="日付", format="%Y-%m-%d"),
-            alt.Tooltip("risk_score:Q", title="リスクスコア"),
+        order=alt.Order("危険度:N", sort="descending"),
+        tooltip=["block:N", "危険度:N", "件数:Q"],
+    )
+
+    bar = bar_base.mark_bar().properties(height=280)
+
+    # ドーナツグラフ：中央に主要な危険度と割合を大きく表示
+    total = n_danger + n_warning + n_safe
+    if n_danger > 0:
+        center_level = "危険"
+        center_pct = round(n_danger / total * 100)
+        center_color = COLOR_DANGER
+    elif n_caution > 0:
+        center_level = "警戒"
+        center_pct = round(n_caution / total * 100)
+        center_color = COLOR_CAUTION
+    elif n_warning > 0:
+        center_level = "注意"
+        center_pct = round(n_warning / total * 100)
+        center_color = COLOR_WARNING
+    else:
+        center_level = "安全"
+        center_pct = 100
+        center_color = COLOR_SAFE
+
+    donut_with_label = (
+        alt.Chart(donut_df)
+        .mark_arc(innerRadius=80, outerRadius=130)
+        .encode(
+            theta=alt.Theta("件数:Q"),
+            color=alt.Color(
+                "危険度:N",
+                scale=alt.Scale(
+                    domain=["危険", "警戒", "注意", "安全"],
+                    range=[COLOR_DANGER, COLOR_CAUTION, COLOR_WARNING, COLOR_SAFE],
+                ),
+                legend=alt.Legend(title="危険度"),
+            ),
+            tooltip=["危険度:N", "件数:Q"],
+        )
+    )
+
+    center_pct_text = (
+        alt.Chart(pd.DataFrame({"label": [f"{center_pct}%"]}))
+        .mark_text(size=32, fontWeight="bold", color=center_color)
+        .encode(text="label:N")
+    )
+
+    center_level_text = (
+        alt.Chart(pd.DataFrame({"label": [center_level], "y": [-38]}))
+        .mark_text(size=16, color=center_color)
+        .encode(text="label:N", y=alt.Y("y:Q", axis=None))
+    )
+
+    col_donut, col_bar = st.columns([1, 1])
+    with col_donut:
+        st.subheader("危険度の分布")
+        st.altair_chart(
+            (donut_with_label + center_pct_text + center_level_text).properties(
+                height=300
+            ),
+            use_container_width=True,
+        )
+    with col_bar:
+        st.subheader("地方別の危険度")
+        st.altair_chart(bar, use_container_width=True)
+
+    st.divider()
+    st.subheader("仕組み")
+    st.markdown("""
+    - **JMA**：気象庁から現在の警報情報を取得
+    - **Open-Meteo（実績）**：過去8日分の気象データ（最高気温・降水量）を取得
+    - **Open-Meteo（予報）**：今後7日間の気象予測データを取得
+    - **スコア計算**：気温・降水・警報・複合条件の4指標で統合評価（上限20点）
+        - 気温38℃以上：+5 / 35℃以上：+3 / 30℃以上：+2 / 0℃以下かつ降水あり：+3
+        - 降水50mm以上：+6 / 20mm以上：+3
+        - 高温かつ大雨（複合リスク）：+3
+        - 警報発令中：+3（最低スコア5を保証）
+        - 15以上：危険 / 10以上：警戒 / 5以上：注意 / 5未満：安全
+    """)
+
+# ───────────────────────────────
+# タブ2：警報
+# ───────────────────────────────
+with tab2:
+    STATUS_ORDER = {"継続": 0, "発表": 1, "警報から注意報へ移行": 2}
+
+    STATUS_ORDER = {"継続": 0, "発表": 1, "警報から注意報へ移行": 2}
+
+    warned = False
+    warn_list = []
+    for region in PREF_COORDS.keys():
+        d = disaster_df[
+            (disaster_df["region"] == region) & (disaster_df["status"] != "解除")
+        ]
+        if not d.empty:
+            d_sorted = d.copy()
+            d_sorted["status_order"] = d_sorted["status"].map(
+                lambda s: STATUS_ORDER.get(s, 99)
+            )
+            events = d_sorted.sort_values("status_order").drop_duplicates(
+                subset=["event_type"]
+            )
+            events_text = "・".join(
+                f"{row['event_type']}（{row['status']}）"
+                for _, row in events.iterrows()
+            )
+            warn_list.append((region, events_text))
+            warned = True
+
+    if not warned:
+        st.success("現在、発令中の警報はありません")
+    else:
+        st.info(f"現在 {len(warn_list)} 県で警報・注意報が発令中です")
+        # 最初の5件は展開済みで表示、残りは折りたたむ
+        for region, events_text in warn_list[:5]:
+            st.warning(f"{region}：{events_text}")
+        if len(warn_list) > 5:
+            with st.expander(f"残り {len(warn_list) - 5} 県を表示"):
+                for region, events_text in warn_list[5:]:
+                    st.warning(f"{region}：{events_text}")
+
+    if not disaster_df.empty:
+        active_warnings = disaster_df[disaster_df["status"] != "解除"]
+        if not active_warnings.empty:
+            # 同一県・同一種別の重複を排除してから集計（最大47件）
+            event_counts = (
+                active_warnings.drop_duplicates(subset=["region", "event_type"])
+                .groupby("event_type")
+                .size()
+                .reset_index(name="件数")
+                .rename(columns={"event_type": "警報種別"})
+                .sort_values("件数", ascending=False)
+            )
+
+            st.subheader("現在発令中の警報種別")
+            warn_base = alt.Chart(event_counts).encode(
+                x=alt.X("件数:Q", title="発令県数", axis=alt.Axis(tickMinStep=1)),
+                y=alt.Y("警報種別:N", sort="-x", title=None),
+                tooltip=["警報種別:N", "件数:Q"],
+            )
+            warn_bar = warn_base.mark_bar(color=COLOR_WARNING)
+            st.altair_chart(warn_bar, use_container_width=True)
+            st.caption(
+                "数値は発令中の都道府県数（同一県に複数種別がある場合はそれぞれカウント）"
+            )
+
+# ───────────────────────────────
+# タブ3：地域分析
+# ───────────────────────────────
+with tab3:
+    st.subheader("リスクランキング")
+
+    # 複合フィルタ
+    f1, f2 = st.columns(2)
+    with f1:
+        filter_block = st.selectbox(
+            "地方ブロックで絞り込む",
+            ["すべて"] + BLOCK_ORDER,
+            index=0,
+        )
+    with f2:
+        filter_level = st.selectbox(
+            "危険度で絞り込む",
+            ["すべて", "危険", "注意", "安全"],
+            index=0,
+        )
+
+    filtered_rank = rank.copy()
+    if filter_block != "すべて":
+        filtered_rank = filtered_rank[filtered_rank["block"] == filter_block]
+    if filter_level != "すべて":
+        filtered_rank = filtered_rank[filtered_rank["risk_level"] == filter_level]
+
+    st.dataframe(
+        filtered_rank.assign(
+            temperature_max=filtered_rank["temperature_max"].map(lambda x: f"{x:.1f}℃"),
+            precipitation_sum=filtered_rank["precipitation_sum"].map(
+                lambda x: f"{x:.1f}mm"
+            ),
+        ).rename(
+            columns={
+                "region": "地域",
+                "block": "地方",
+                "risk_score": "リスク",
+                "risk_level": "危険度",
+                "temperature_max": "最高気温",
+                "precipitation_sum": "降水量",
+                "compound_score": "複合",
+            }
+        )[
+            ["地域", "地方", "リスク", "危険度", "最高気温", "降水量", "複合"]
         ],
-    ),
-    use_container_width=True,
-)
+        hide_index=True,
+        use_container_width=True,
+    )
 
-st.markdown("### 地域ごとのリスク分布（赤いほど危険）")
-st.caption("※ 注意以上の地域のみ表示（円の大きさは警報数を表します）")
+    st.subheader("地域ごとのリスク分布")
+    st.caption("注意以上の地域のみ表示（円の大きさは警報数を表します）")
 
-m = folium.Map(location=[36, 138], zoom_start=5)
+    m = folium.Map(location=[36, 138], zoom_start=5)
 
-for _, r in latest.iterrows():
-    if r["risk_score"] < RISK_WARNING:
-        continue
+    for _, r in latest.iterrows():
+        if r["risk_score"] < RISK_WARNING:
+            continue
+        if r["region"] not in PREF_COORDS:
+            continue
 
-    if r["region"] not in PREF_COORDS:
-        continue
+        color = (
+            COLOR_DANGER
+            if r["risk_score"] >= RISK_DANGER
+            else COLOR_CAUTION if r["risk_score"] >= RISK_CAUTION else COLOR_WARNING
+        )
 
-    color = "red" if r["risk_score"] >= RISK_DANGER else "orange"
+        popup_html = f"""
+        <b>{r['region']}</b><br>
+        地方：{r['block']}<br>
+        危険度：{r['risk_level']}<br>
+        リスク：{int(r['risk_score'])}<br>
+        警報数：{int(r['warning_count'])}
+        """
 
-    popup_html = f"""
-    <b>{r['region']}</b><br>
-    危険度：{r['risk_level']}<br>
-    リスク：{int(r['risk_score'])}<br>
-    警報数：{int(r['warning_count'])}
-    """
+        folium.CircleMarker(
+            location=PREF_COORDS[r["region"]],
+            radius=12 if r["warning_count"] > 0 else 6,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.7,
+            popup=folium.Popup(popup_html, max_width=250),
+        ).add_to(m)
 
-    folium.CircleMarker(
-        location=PREF_COORDS[r["region"]],
-        radius=12 if r["warning_count"] > 0 else 6,
-        color=color,
-        fill=True,
-        popup=folium.Popup(popup_html, max_width=250),
-    ).add_to(m)
+    st_folium(m, width=None, height=500, use_container_width=True)
 
-st_folium(m, width=900, height=500)
+# ───────────────────────────────
+# タブ4：トレンド
+# ───────────────────────────────
+with tab4:
+    regions = sorted(PREF_COORDS.keys())
+    default_index = regions.index("大阪府") if "大阪府" in regions else 0
+    sel = st.selectbox("地域選択", regions, index=default_index)
 
-st.header("仕組み")
+    # 過去データ（DB）
+    past_df = risk_df[risk_df["region"] == sel].copy()
+    past_df["observed_date"] = pd.to_datetime(past_df["observed_date"])
+    past_df["type"] = "実績"
 
-st.markdown("""
-- **JMA**：気象庁から現在の警報情報を取得
-- **Open-Meteo**：過去8日分の気象データ（最高気温・降水量）を取得
-- **スコア計算**：気温・降水・警報の3指標を数値化して統合評価
-    - 気温35℃以上：+3 / 30℃以上：+2
-    - 降水50mm以上：+3 / 20mm以上：+2
-    - 警報発令中：+3
-    - 合計7以上：危険 / 3以上：注意 / 3未満：安全
-""")
+    # 予測データ（API）
+    with st.spinner("予測データを取得しています..."):
+        lat, lon = PREF_COORDS[sel]
+        forecast_records = fetch_forecast(sel, lat, lon)
+
+    if not forecast_records:
+        st.warning("予測データの取得に失敗しました")
+        combined_temp = past_df
+        combined_rain = past_df
+    else:
+        forecast_df = pd.DataFrame(forecast_records)
+        forecast_df["observed_date"] = pd.to_datetime(forecast_df["observed_date"])
+        forecast_df = forecast_df.drop_duplicates(subset=["observed_date"]).sort_values(
+            "observed_date"
+        )
+        forecast_df["type"] = "予測"
+
+        # 過去と予測を結合（typeで実績/予測を区別）
+        combined = pd.concat(
+            [
+                past_df[
+                    ["observed_date", "temperature_max", "precipitation_sum", "type"]
+                ],
+                forecast_df[
+                    ["observed_date", "temperature_max", "precipitation_sum", "type"]
+                ],
+            ],
+            ignore_index=True,
+        ).sort_values("observed_date")
+
+    # しきい値ライン
+    temp_w_rule, temp_d_rule = make_threshold_rules(
+        TEMP_WARNING, TEMP_DANGER, f"注意 {TEMP_WARNING}℃", f"危険 {TEMP_DANGER}℃"
+    )
+    rain_w_rule, rain_d_rule = make_threshold_rules(
+        RAIN_WARNING, RAIN_DANGER, f"注意 {RAIN_WARNING}mm", f"危険 {RAIN_DANGER}mm"
+    )
+
+    # 今日の境界線（実績と予測の区切り）- 太く・色を強調
+    today_rule = (
+        alt.Chart(
+            pd.DataFrame({"x": [pd.Timestamp(TODAY)], "label": ["← 実績 ｜ 予測 →"]})
+        )
+        .mark_rule(color="#aaaaaa", strokeWidth=2)
+        .encode(x="x:T", tooltip=alt.Tooltip("label:N", title=""))
+    )
+
+    st.subheader(f"気温の推移と予測 ／ {sel}")
+    st.caption(
+        "🟠 実線＝過去8日の実績　⬜ 点線＝今後7日の予測　｜ 縦線＝今日　- - 基準ライン（黄：注意 / 赤：危険）"
+    )
+
+    temp_chart = (
+        alt.Chart(combined)
+        .mark_line()
+        .encode(
+            x=make_x_axis("day"),
+            y=alt.Y("temperature_max:Q", title="最高気温（℃）"),
+            color=alt.Color(
+                "type:N",
+                scale=alt.Scale(domain=["実績", "予測"], range=[COLOR_WARNING, "gray"]),
+                legend=alt.Legend(title="種別"),
+            ),
+            strokeDash=alt.StrokeDash(
+                "type:N",
+                scale=alt.Scale(domain=["実績", "予測"], range=[[1, 0], [6, 3]]),
+            ),
+            tooltip=[
+                alt.Tooltip("observed_date:T", title="日付", format="%Y-%m-%d"),
+                alt.Tooltip("temperature_max:Q", title="最高気温（℃）"),
+                alt.Tooltip("type:N", title="種別"),
+            ],
+        )
+    )
+    st.altair_chart(
+        temp_chart + temp_w_rule + temp_d_rule + today_rule,
+        use_container_width=True,
+    )
+
+    st.subheader(f"降水量の推移と予測 ／ {sel}")
+
+    rain_chart = (
+        alt.Chart(combined)
+        .mark_line()
+        .encode(
+            x=make_x_axis("day"),
+            y=alt.Y("precipitation_sum:Q", title="降水量（mm）"),
+            color=alt.Color(
+                "type:N",
+                scale=alt.Scale(
+                    domain=["実績", "予測"], range=["steelblue", "lightblue"]
+                ),
+                legend=alt.Legend(title="種別"),
+            ),
+            strokeDash=alt.StrokeDash(
+                "type:N",
+                scale=alt.Scale(domain=["実績", "予測"], range=[[1, 0], [6, 3]]),
+            ),
+            tooltip=[
+                alt.Tooltip("observed_date:T", title="日付", format="%Y-%m-%d"),
+                alt.Tooltip("precipitation_sum:Q", title="降水量（mm）"),
+                alt.Tooltip("type:N", title="種別"),
+            ],
+        )
+    )
+    st.altair_chart(
+        rain_chart + rain_w_rule + rain_d_rule + today_rule,
+        use_container_width=True,
+    )
